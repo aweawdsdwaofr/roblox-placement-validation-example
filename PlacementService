@@ -1,0 +1,211 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local remotesFolder = ReplicatedStorage:WaitForChild("Remotes")
+local placeRequest = remotesFolder:WaitForChild("PlaceItem")
+
+local PlacementService = {}
+
+local placeDistanceLimit = 45
+local placementGridSize = 2
+local requestGap = 0.25
+
+local lastPlaceAttempt = {}
+local inventoryCache = {}
+
+local placeableItems = {
+	BasicKeycap = {
+		ModelName = "BasicKeycap",
+		Limit = 50,
+		Stackable = true,
+	},
+
+	RareKeycap = {
+		ModelName = "RareKeycap",
+		Limit = 25,
+		Stackable = true,
+	},
+
+	GoldenKeycap = {
+		ModelName = "GoldenKeycap",
+		Limit = 10,
+		Stackable = false,
+	},
+}
+
+local function roundToGrid(number)
+	return math.floor((number / placementGridSize) + 0.5) * placementGridSize
+end
+
+local function snapToGrid(position)
+	return Vector3.new(
+		roundToGrid(position.X),
+		position.Y,
+		roundToGrid(position.Z)
+	)
+end
+
+local function getRootPart(player)
+	local character = player.Character
+	if not character then
+		return nil
+	end
+
+	return character:FindFirstChild("HumanoidRootPart")
+end
+
+local function requestIsTooFast(player)
+	local lastAttempt = lastPlaceAttempt[player]
+	local now = os.clock()
+
+	if lastAttempt and now - lastAttempt < requestGap then
+		return true
+	end
+
+	lastPlaceAttempt[player] = now
+	return false
+end
+
+local function getPlayerInventory(player)
+	local inventory = inventoryCache[player]
+
+	if inventory then
+		return inventory
+	end
+
+	inventory = {
+		BasicKeycap = 5,
+		RareKeycap = 2,
+		GoldenKeycap = 1,
+	}
+
+	inventoryCache[player] = inventory
+
+	return inventory
+end
+
+local function hasItem(player, itemName)
+	local inventory = getPlayerInventory(player)
+	local amount = inventory[itemName]
+
+	return amount ~= nil and amount > 0
+end
+
+local function takeItem(player, itemName)
+	local inventory = getPlayerInventory(player)
+	local amount = inventory[itemName]
+
+	if not amount or amount <= 0 then
+		return false
+	end
+
+	inventory[itemName] = amount - 1
+	return true
+end
+
+local function canPlaceAt(player, position)
+	if typeof(position) ~= "Vector3" then
+		return false, "Bad position"
+	end
+
+	local rootPart = getRootPart(player)
+	if not rootPart then
+		return false, "Character not ready"
+	end
+
+	local distance = (rootPart.Position - position).Magnitude
+
+	if distance > placeDistanceLimit then
+		return false, "Too far away"
+	end
+
+	return true
+end
+
+local function spawnPlacedItem(player, itemName, position)
+	local itemInfo = placeableItems[itemName]
+	if not itemInfo then
+		return nil
+	end
+
+	local itemFolder = ReplicatedStorage:WaitForChild("PlaceableItems")
+	local itemTemplate = itemFolder:FindFirstChild(itemInfo.ModelName)
+
+	if not itemTemplate then
+		warn("Missing placeable item:", itemInfo.ModelName)
+		return nil
+	end
+
+	local placedFolder = workspace:FindFirstChild("PlacedItems")
+	if not placedFolder then
+		placedFolder = Instance.new("Folder")
+		placedFolder.Name = "PlacedItems"
+		placedFolder.Parent = workspace
+	end
+
+	local newItem = itemTemplate:Clone()
+	local finalPosition = snapToGrid(position)
+
+	newItem.Name = itemName .. "_" .. player.UserId
+	newItem:SetAttribute("OwnerUserId", player.UserId)
+	newItem:SetAttribute("ItemName", itemName)
+
+	if newItem:IsA("Model") then
+		newItem:PivotTo(CFrame.new(finalPosition))
+	elseif newItem:IsA("BasePart") then
+		newItem.Position = finalPosition
+	end
+
+	newItem.Parent = placedFolder
+
+	return newItem
+end
+
+function PlacementService.TryPlace(player, itemName, position)
+	if typeof(itemName) ~= "string" then
+		return false, "Invalid item"
+	end
+
+	if requestIsTooFast(player) then
+		return false, "Slow down"
+	end
+
+	if not placeableItems[itemName] then
+		return false, "Item not found"
+	end
+
+	if not hasItem(player, itemName) then
+		return false, "You do not own this item"
+	end
+
+	local canPlace, reason = canPlaceAt(player, position)
+	if not canPlace then
+		return false, reason
+	end
+
+	local placedItem = spawnPlacedItem(player, itemName, position)
+	if not placedItem then
+		return false, "Placement failed"
+	end
+
+	takeItem(player, itemName)
+
+	return true, "Placed"
+end
+
+placeRequest.OnServerEvent:Connect(function(player, itemName, position)
+	local success, message = PlacementService.TryPlace(player, itemName, position)
+
+	placeRequest:FireClient(player, {
+		Success = success,
+		Message = message,
+		ItemName = itemName,
+	})
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	lastPlaceAttempt[player] = nil
+	inventoryCache[player] = nil
+end)
+
+return PlacementService
