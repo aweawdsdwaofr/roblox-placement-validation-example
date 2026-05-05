@@ -1,69 +1,105 @@
+-- PlacementService.lua
+-- Server-sided placement validation module.
+-- This script does not trust the client. The client can request a placement,
+-- but the server checks ownership, distance, grid snapping, item limits,
+-- collision, and basic plot rules before creating the item.
+
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+
+local PlacementService = {}
 
 local remotesFolder = ReplicatedStorage:WaitForChild("Remotes")
 local placeRequest = remotesFolder:WaitForChild("PlaceItem")
 
-local PlacementService = {}
+local placeableFolder = ReplicatedStorage:WaitForChild("PlaceableItems")
+
+local placedFolder = Workspace:FindFirstChild("PlacedItems")
+
+if not placedFolder then
+	placedFolder = Instance.new("Folder")
+	placedFolder.Name = "PlacedItems"
+	placedFolder.Parent = Workspace
+end
+
+local plotFolder = Workspace:FindFirstChild("Plots")
 
 local placeDistanceLimit = 45
 local placementGridSize = 2
 local requestGap = 0.25
+local maxRaycastHeight = 200
+local raycastDepth = 500
+local defaultItemHeightOffset = 0
+local overlapPadding = 0.15
 
 local lastPlaceAttempt = {}
 local inventoryCache = {}
+local placedCountCache = {}
 
 local placeableItems = {
 	BasicKeycap = {
 		ModelName = "BasicKeycap",
 		Limit = 50,
 		Stackable = true,
+		CanCollideCheck = true,
+		HeightOffset = 0,
 	},
 
 	RareKeycap = {
 		ModelName = "RareKeycap",
 		Limit = 25,
 		Stackable = true,
+		CanCollideCheck = true,
+		HeightOffset = 0,
 	},
 
 	GoldenKeycap = {
 		ModelName = "GoldenKeycap",
 		Limit = 10,
 		Stackable = false,
+		CanCollideCheck = true,
+		HeightOffset = 0,
 	},
 }
 
 local function roundToGrid(number)
-	return math.floor((number / placementGridSize) + 0.5) * placementGridSize
+	local divided = number / placementGridSize
+	local rounded = math.floor(divided + 0.5)
+	local snapped = rounded * placementGridSize
+
+	return snapped
 end
 
 local function snapToGrid(position)
-	return Vector3.new(
-		roundToGrid(position.X),
-		position.Y,
-		roundToGrid(position.Z)
-	)
+	local snappedX = roundToGrid(position.X)
+	local snappedZ = roundToGrid(position.Z)
+	local snappedPosition = Vector3.new(snappedX, position.Y, snappedZ)
+
+	return snappedPosition
 end
 
 local function getRootPart(player)
 	local character = player.Character
+
 	if not character then
 		return nil
 	end
 
-	return character:FindFirstChild("HumanoidRootPart")
-end
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
 
-local function requestIsTooFast(player)
-	local lastAttempt = lastPlaceAttempt[player]
-	local now = os.clock()
-
-	if lastAttempt and now - lastAttempt < requestGap then
-		return true
+	if not rootPart then
+		return nil
 	end
 
-	lastPlaceAttempt[player] = now
-	return false
+	return rootPart
+end
+
+local function getPlayerKey(player)
+	local key = tostring(player.UserId)
+
+	return key
 end
 
 local function getPlayerInventory(player)
@@ -73,42 +109,141 @@ local function getPlayerInventory(player)
 		return inventory
 	end
 
-	inventory = {
-		BasicKeycap = 5,
-		RareKeycap = 2,
-		GoldenKeycap = 1,
-	}
+	inventory = {}
+	inventory.BasicKeycap = 5
+	inventory.RareKeycap = 2
+	inventory.GoldenKeycap = 1
 
 	inventoryCache[player] = inventory
 
 	return inventory
 end
 
+local function getPlacedCountTable(player)
+	local countTable = placedCountCache[player]
+
+	if countTable then
+		return countTable
+	end
+
+	countTable = {}
+	countTable.BasicKeycap = 0
+	countTable.RareKeycap = 0
+	countTable.GoldenKeycap = 0
+
+	placedCountCache[player] = countTable
+
+	return countTable
+end
+
+local function getItemInfo(itemName)
+	local itemInfo = placeableItems[itemName]
+
+	if not itemInfo then
+		return nil
+	end
+
+	return itemInfo
+end
+
+local function getItemTemplate(itemName)
+	local itemInfo = getItemInfo(itemName)
+
+	if not itemInfo then
+		return nil
+	end
+
+	local template = placeableFolder:FindFirstChild(itemInfo.ModelName)
+
+	if not template then
+		return nil
+	end
+
+	return template
+end
+
 local function hasItem(player, itemName)
 	local inventory = getPlayerInventory(player)
 	local amount = inventory[itemName]
 
-	return amount ~= nil and amount > 0
+	if amount == nil then
+		return false
+	end
+
+	if amount <= 0 then
+		return false
+	end
+
+	return true
 end
 
 local function takeItem(player, itemName)
 	local inventory = getPlayerInventory(player)
 	local amount = inventory[itemName]
 
-	if not amount or amount <= 0 then
+	if amount == nil then
+		return false
+	end
+
+	if amount <= 0 then
 		return false
 	end
 
 	inventory[itemName] = amount - 1
+
 	return true
 end
 
-local function canPlaceAt(player, position)
-	if typeof(position) ~= "Vector3" then
-		return false, "Bad position"
+local function giveItem(player, itemName, amount)
+	local inventory = getPlayerInventory(player)
+	local oldAmount = inventory[itemName] or 0
+	local newAmount = oldAmount + amount
+
+	inventory[itemName] = newAmount
+
+	return newAmount
+end
+
+local function requestIsTooFast(player)
+	local now = os.clock()
+	local lastAttempt = lastPlaceAttempt[player]
+
+	if lastAttempt then
+		local difference = now - lastAttempt
+
+		if difference < requestGap then
+			return true
+		end
 	end
 
+	lastPlaceAttempt[player] = now
+
+	return false
+end
+
+local function isValidVector3(position)
+	if typeof(position) ~= "Vector3" then
+		return false
+	end
+
+	if position.X ~= position.X then
+		return false
+	end
+
+	if position.Y ~= position.Y then
+		return false
+	end
+
+	if position.Z ~= position.Z then
+		return false
+	end
+
+	return true
+end
+
+local function isPlayerCloseEnough(player, position)
 	local rootPart = getRootPart(player)
+
 	if not rootPart then
 		return false, "Character not ready"
 	end
@@ -119,93 +254,584 @@ local function canPlaceAt(player, position)
 		return false, "Too far away"
 	end
 
+	return true, "Close enough"
+end
+
+local function getModelBoundingBox(instance)
+	if instance:IsA("Model") then
+		local cframe, size = instance:GetBoundingBox()
+
+		return cframe, size
+	end
+
+	if instance:IsA("BasePart") then
+		local cframe = instance.CFrame
+		local size = instance.Size
+
+		return cframe, size
+	end
+
+	return CFrame.new(), Vector3.new(2, 2, 2)
+end
+
+local function getTemplateSize(template)
+	if template:IsA("Model") then
+		local _, size = template:GetBoundingBox()
+
+		return size
+	end
+
+	if template:IsA("BasePart") then
+		return template.Size
+	end
+
+	return Vector3.new(2, 2, 2)
+end
+
+local function makeRaycastParams(player)
+	local params = RaycastParams.new()
+	local ignoreList = {}
+
+	if player.Character then
+		table.insert(ignoreList, player.Character)
+	end
+
+	table.insert(ignoreList, placedFolder)
+
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignoreList
+	params.IgnoreWater = true
+
+	return params
+end
+
+local function getGroundPosition(player, requestedPosition)
+	local origin = Vector3.new(requestedPosition.X, requestedPosition.Y + maxRaycastHeight, requestedPosition.Z)
+	local direction = Vector3.new(0, -raycastDepth, 0)
+	local params = makeRaycastParams(player)
+	local result = Workspace:Raycast(origin, direction, params)
+
+	if not result then
+		return requestedPosition
+	end
+
+	local groundPosition = result.Position
+
+	return groundPosition
+end
+
+local function findPlayerPlot(player)
+	if not plotFolder then
+		return nil
+	end
+
+	for _, plot in ipairs(plotFolder:GetChildren()) do
+		local ownerId = plot:GetAttribute("OwnerUserId")
+
+		if ownerId == player.UserId then
+			return plot
+		end
+	end
+
+	return nil
+end
+
+local function getPlotBasePart(plot)
+	if not plot then
+		return nil
+	end
+
+	if plot:IsA("BasePart") then
+		return plot
+	end
+
+	local base = plot:FindFirstChild("Base")
+
+	if base and base:IsA("BasePart") then
+		return base
+	end
+
+	local floor = plot:FindFirstChild("Floor")
+
+	if floor and floor:IsA("BasePart") then
+		return floor
+	end
+
+	for _, child in ipairs(plot:GetDescendants()) do
+		if child:IsA("BasePart") then
+			return child
+		end
+	end
+
+	return nil
+end
+
+local function positionIsInsidePart(position, part)
+	local localPosition = part.CFrame:PointToObjectSpace(position)
+	local halfSize = part.Size * 0.5
+
+	if math.abs(localPosition.X) > halfSize.X then
+		return false
+	end
+
+	if math.abs(localPosition.Z) > halfSize.Z then
+		return false
+	end
+
 	return true
 end
 
-local function spawnPlacedItem(player, itemName, position)
-	local itemInfo = placeableItems[itemName]
+local function positionIsOnPlayerPlot(player, position)
+	local plot = findPlayerPlot(player)
+
+	if not plot then
+		return true
+	end
+
+	local basePart = getPlotBasePart(plot)
+
+	if not basePart then
+		return true
+	end
+
+	local inside = positionIsInsidePart(position, basePart)
+
+	if not inside then
+		return false, "Not on your plot"
+	end
+
+	return true, "On plot"
+end
+
+local function buildOverlapParams(player)
+	local params = OverlapParams.new()
+	local ignoreList = {}
+
+	if player.Character then
+		table.insert(ignoreList, player.Character)
+	end
+
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignoreList
+
+	return params
+end
+
+local function getPartsInPlacementBox(player, cframe, size)
+	local params = buildOverlapParams(player)
+	local adjustedSize = Vector3.new(
+		math.max(size.X - overlapPadding, 0.1),
+		math.max(size.Y - overlapPadding, 0.1),
+		math.max(size.Z - overlapPadding, 0.1)
+	)
+
+	local parts = Workspace:GetPartBoundsInBox(cframe, adjustedSize, params)
+
+	return parts
+end
+
+local function partBelongsToPlacedItem(part)
+	if not part then
+		return false
+	end
+
+	local current = part
+
+	while current and current ~= Workspace do
+		if current.Parent == placedFolder then
+			return true
+		end
+
+		current = current.Parent
+	end
+
+	return false
+end
+
+local function placementSpaceIsFree(player, cframe, size)
+	local parts = getPartsInPlacementBox(player, cframe, size)
+
+	for _, part in ipairs(parts) do
+		if part:IsA("BasePart") then
+			if partBelongsToPlacedItem(part) then
+				return false, "Something is already placed there"
+			end
+		end
+	end
+
+	return true, "Space is free"
+end
+
+local function getPlacementCFrame(player, itemName, requestedPosition)
+	local itemInfo = getItemInfo(itemName)
+	local template = getItemTemplate(itemName)
+
 	if not itemInfo then
+		return nil, nil, "Invalid item"
+	end
+
+	if not template then
+		return nil, nil, "Missing item model"
+	end
+
+	local groundPosition = getGroundPosition(player, requestedPosition)
+	local snappedGround = snapToGrid(groundPosition)
+	local size = getTemplateSize(template)
+	local heightOffset = itemInfo.HeightOffset or defaultItemHeightOffset
+	local yPosition = snappedGround.Y + (size.Y * 0.5) + heightOffset
+	local finalPosition = Vector3.new(snappedGround.X, yPosition, snappedGround.Z)
+	local finalCFrame = CFrame.new(finalPosition)
+
+	return finalCFrame, size, "Placement CFrame ready"
+end
+
+local function playerReachedItemLimit(player, itemName)
+	local itemInfo = getItemInfo(itemName)
+
+	if not itemInfo then
+		return true, "Invalid item"
+	end
+
+	local countTable = getPlacedCountTable(player)
+	local currentCount = countTable[itemName] or 0
+	local limit = itemInfo.Limit or math.huge
+
+	if currentCount >= limit then
+		return true, "Item limit reached"
+	end
+
+	return false, "Under limit"
+end
+
+local function addPlacedCount(player, itemName)
+	local countTable = getPlacedCountTable(player)
+	local currentCount = countTable[itemName] or 0
+
+	countTable[itemName] = currentCount + 1
+
+	return countTable[itemName]
+end
+
+local function removePlacedCount(player, itemName)
+	local countTable = getPlacedCountTable(player)
+	local currentCount = countTable[itemName] or 0
+	local newCount = math.max(currentCount - 1, 0)
+
+	countTable[itemName] = newCount
+
+	return newCount
+end
+
+local function applyOwnerAttributes(item, player, itemName)
+	local placementId = HttpService:GenerateGUID(false)
+	local playerKey = getPlayerKey(player)
+
+	item:SetAttribute("PlacementId", placementId)
+	item:SetAttribute("OwnerUserId", player.UserId)
+	item:SetAttribute("OwnerKey", playerKey)
+	item:SetAttribute("ItemName", itemName)
+	item:SetAttribute("PlacedAt", os.time())
+
+	return placementId
+end
+
+local function anchorItem(item)
+	if item:IsA("BasePart") then
+		item.Anchored = true
+		return
+	end
+
+	if item:IsA("Model") then
+		for _, descendant in ipairs(item:GetDescendants()) do
+			if descendant:IsA("BasePart") then
+				descendant.Anchored = true
+			end
+		end
+	end
+end
+
+local function pivotItem(item, cframe)
+	if item:IsA("Model") then
+		item:PivotTo(cframe)
+		return true
+	end
+
+	if item:IsA("BasePart") then
+		item.CFrame = cframe
+		return true
+	end
+
+	return false
+end
+
+local function spawnPlacedItem(player, itemName, cframe)
+	local template = getItemTemplate(itemName)
+
+	if not template then
+		warn("Missing placeable item template:", itemName)
 		return nil
 	end
 
-	local itemFolder = ReplicatedStorage:WaitForChild("PlaceableItems")
-	local itemTemplate = itemFolder:FindFirstChild(itemInfo.ModelName)
+	local newItem = template:Clone()
+	local pivoted = pivotItem(newItem, cframe)
 
-	if not itemTemplate then
-		warn("Missing placeable item:", itemInfo.ModelName)
+	if not pivoted then
+		newItem:Destroy()
 		return nil
 	end
 
-	local placedFolder = workspace:FindFirstChild("PlacedItems")
-	if not placedFolder then
-		placedFolder = Instance.new("Folder")
-		placedFolder.Name = "PlacedItems"
-		placedFolder.Parent = workspace
-	end
-
-	local newItem = itemTemplate:Clone()
-	local finalPosition = snapToGrid(position)
+	anchorItem(newItem)
+	applyOwnerAttributes(newItem, player, itemName)
 
 	newItem.Name = itemName .. "_" .. player.UserId
-	newItem:SetAttribute("OwnerUserId", player.UserId)
-	newItem:SetAttribute("ItemName", itemName)
-
-	if newItem:IsA("Model") then
-		newItem:PivotTo(CFrame.new(finalPosition))
-	elseif newItem:IsA("BasePart") then
-		newItem.Position = finalPosition
-	end
-
 	newItem.Parent = placedFolder
 
 	return newItem
 end
 
-function PlacementService.TryPlace(player, itemName, position)
+local function validateItemName(itemName)
 	if typeof(itemName) ~= "string" then
 		return false, "Invalid item"
 	end
 
-	if requestIsTooFast(player) then
-		return false, "Slow down"
+	if itemName == "" then
+		return false, "Invalid item"
 	end
 
 	if not placeableItems[itemName] then
 		return false, "Item not found"
 	end
 
+	return true, "Item valid"
+end
+
+local function validatePlacementRequest(player, itemName, position)
+	local validItem, itemReason = validateItemName(itemName)
+
+	if not validItem then
+		return false, itemReason
+	end
+
+	if not isValidVector3(position) then
+		return false, "Bad position"
+	end
+
+	local closeEnough, distanceReason = isPlayerCloseEnough(player, position)
+
+	if not closeEnough then
+		return false, distanceReason
+	end
+
+	local onPlot, plotReason = positionIsOnPlayerPlot(player, position)
+
+	if not onPlot then
+		return false, plotReason
+	end
+
 	if not hasItem(player, itemName) then
 		return false, "You do not own this item"
 	end
 
-	local canPlace, reason = canPlaceAt(player, position)
-	if not canPlace then
+	local reachedLimit, limitReason = playerReachedItemLimit(player, itemName)
+
+	if reachedLimit then
+		return false, limitReason
+	end
+
+	return true, "Request valid"
+end
+
+local function validatePlacementSpace(player, itemName, position)
+	local cframe, size, cframeReason = getPlacementCFrame(player, itemName, position)
+
+	if not cframe then
+		return false, nil, cframeReason
+	end
+
+	local itemInfo = getItemInfo(itemName)
+
+	if itemInfo and itemInfo.CanCollideCheck then
+		local free, freeReason = placementSpaceIsFree(player, cframe, size)
+
+		if not free then
+			return false, nil, freeReason
+		end
+	end
+
+	return true, cframe, "Space valid"
+end
+
+local function buildClientResponse(success, message, itemName, extraData)
+	local response = {}
+	response.Success = success
+	response.Message = message
+	response.ItemName = itemName
+
+	if extraData then
+		for key, value in pairs(extraData) do
+			response[key] = value
+		end
+	end
+
+	return response
+end
+
+function PlacementService.GetInventory(player)
+	local inventory = getPlayerInventory(player)
+	local copy = {}
+
+	for itemName, amount in pairs(inventory) do
+		copy[itemName] = amount
+	end
+
+	return copy
+end
+
+function PlacementService.GiveItem(player, itemName, amount)
+	if typeof(amount) ~= "number" then
+		return false, "Invalid amount"
+	end
+
+	if amount <= 0 then
+		return false, "Invalid amount"
+	end
+
+	local validItem, reason = validateItemName(itemName)
+
+	if not validItem then
 		return false, reason
 	end
 
-	local placedItem = spawnPlacedItem(player, itemName, position)
+	giveItem(player, itemName, amount)
+
+	return true, "Item given"
+end
+
+function PlacementService.GetPlacedCounts(player)
+	local countTable = getPlacedCountTable(player)
+	local copy = {}
+
+	for itemName, count in pairs(countTable) do
+		copy[itemName] = count
+	end
+
+	return copy
+end
+
+function PlacementService.TryPlace(player, itemName, position)
+	if not player then
+		return false, "Invalid player"
+	end
+
+	if requestIsTooFast(player) then
+		return false, "Slow down"
+	end
+
+	local requestValid, requestReason = validatePlacementRequest(player, itemName, position)
+
+	if not requestValid then
+		return false, requestReason
+	end
+
+	local spaceValid, cframe, spaceReason = validatePlacementSpace(player, itemName, position)
+
+	if not spaceValid then
+		return false, spaceReason
+	end
+
+	local removed = takeItem(player, itemName)
+
+	if not removed then
+		return false, "Inventory changed"
+	end
+
+	local placedItem = spawnPlacedItem(player, itemName, cframe)
+
 	if not placedItem then
+		giveItem(player, itemName, 1)
 		return false, "Placement failed"
 	end
 
-	takeItem(player, itemName)
+	addPlacedCount(player, itemName)
 
-	return true, "Placed"
+	return true, "Placed", placedItem
+end
+
+function PlacementService.RemovePlacedItem(player, item)
+	if not item then
+		return false, "Invalid item"
+	end
+
+	if item.Parent ~= placedFolder then
+		return false, "Item is not placed"
+	end
+
+	local ownerUserId = item:GetAttribute("OwnerUserId")
+
+	if ownerUserId ~= player.UserId then
+		return false, "You do not own this item"
+	end
+
+	local itemName = item:GetAttribute("ItemName")
+
+	if typeof(itemName) ~= "string" then
+		return false, "Missing item name"
+	end
+
+	item:Destroy()
+	removePlacedCount(player, itemName)
+	giveItem(player, itemName, 1)
+
+	return true, "Removed"
+end
+
+function PlacementService.ClearPlayerItems(player)
+	local removedAmount = 0
+
+	for _, item in ipairs(placedFolder:GetChildren()) do
+		local ownerUserId = item:GetAttribute("OwnerUserId")
+
+		if ownerUserId == player.UserId then
+			local itemName = item:GetAttribute("ItemName")
+
+			if typeof(itemName) == "string" then
+				removePlacedCount(player, itemName)
+				giveItem(player, itemName, 1)
+			end
+
+			item:Destroy()
+			removedAmount += 1
+		end
+	end
+
+	return removedAmount
+end
+
+local function onPlaceRequest(player, itemName, position)
+	local success, message, placedItem = PlacementService.TryPlace(player, itemName, position)
+	local extraData = {}
+
+	if placedItem then
+		extraData.PlacementId = placedItem:GetAttribute("PlacementId")
+	end
+
+	local response = buildClientResponse(success, message, itemName, extraData)
+
+	placeRequest:FireClient(player, response)
+end
+
+local function cleanPlayerCache(player)
+	lastPlaceAttempt[player] = nil
+	inventoryCache[player] = nil
+	placedCountCache[player] = nil
 end
 
 placeRequest.OnServerEvent:Connect(function(player, itemName, position)
-	local success, message = PlacementService.TryPlace(player, itemName, position)
-
-	placeRequest:FireClient(player, {
-		Success = success,
-		Message = message,
-		ItemName = itemName,
-	})
+	onPlaceRequest(player, itemName, position)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
-	lastPlaceAttempt[player] = nil
-	inventoryCache[player] = nil
+	cleanPlayerCache(player)
 end)
 
 return PlacementService
