@@ -1,4 +1,3 @@
--- PlacementService.lua
 -- Server-sided placement validation module.
 -- This script does not trust the client. The client can request a placement,
 -- but the server checks ownership, distance, grid snapping, item limits,
